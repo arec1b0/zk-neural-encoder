@@ -3,121 +3,135 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 import mlflow
-from mlflow.models import infer_signature
-import time
-from typing import Tuple, List, Dict, Any
+import logging
+import os
 from zk_neural_encoder.analyzer.static_analyzer import ContractFeature
-from zk_neural_encoder.estimator.constraint_cost import EncodingType, ConstraintCostEstimator
-from zk_neural_encoder.utils.logging_config import setup_logger
+from zk_neural_encoder.estimator.constraint_cost import ConstraintCostEstimator, EncodingType
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
-class EncodingPolicyNetwork(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int) -> None:
-        super().__init__()
-        self.network = nn.Sequential(
+class ActorCritic(nn.Module):
+    def __init__(self, input_dim: int, num_actions: int):
+        super(ActorCritic, self).__init__()
+        self.shared = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, output_dim),
-            nn.Softmax(dim=-1)
+            nn.Linear(64, 64),
+            nn.ReLU()
         )
+        self.actor = nn.Linear(64, num_actions)
+        self.critic = nn.Linear(64, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
+    def forward(self, x):
+        features = self.shared(x)
+        logits = self.actor(features)
+        value = self.critic(features)
+        return logits, value
 
 class ReinforcementOptimizer:
-    def __init__(self, learning_rate: float = 1e-3) -> None:
-        self.encodings = list(EncodingType)
-        self.policy = EncodingPolicyNetwork(input_dim=2, output_dim=len(self.encodings))
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        logger.info("Initialized ReinforcementOptimizer (REINFORCE Agent)")
+    def __init__(self, input_dim: int = 3, num_actions: int = 2):
+        self.model = ActorCritic(input_dim, num_actions)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        
+        # PPO Hyperparameters
+        self.clip_eps = 0.2
+        self.c_value = 0.5
+        self.c_entropy = 0.01
+        self.ppo_epochs = 4
+
+        logger.info("Initialized ReinforcementOptimizer (PPO Agent)")
 
     def _feature_to_tensor(self, feature: ContractFeature) -> torch.Tensor:
-        return torch.tensor([float(feature.size_bytes), float(feature.is_mutable)], dtype=torch.float32)
+        type_val = 1.0 if "uint" in feature.data_type else 0.0
+        return torch.tensor([float(feature.size_bytes), type_val, float(feature.is_mutable)])
 
-    def optimize_encoding(self, feature: ContractFeature, deterministic: bool = True) -> Tuple[EncodingType, int, torch.Tensor]:
-        """
-        Selects an encoding. If deterministic is False, it samples from the distribution (for training).
-        Returns the encoding, cost, and the log probability of the selected action.
-        """
-        state = self._feature_to_tensor(feature)
-        probabilities = self.policy(state)
+    def optimize_encoding(self, feature: ContractFeature, deterministic: bool = False):
+        state = self._feature_to_tensor(feature).unsqueeze(0)
         
-        m = Categorical(probabilities)
-        if deterministic:
-            action_idx = torch.argmax(probabilities).item()
-        else:
-            action_idx = m.sample().item()
+        with torch.no_grad():
+            logits, _ = self.model(state)
+            probs = torch.softmax(logits, dim=-1)
+            dist = Categorical(probs)
             
-        selected_encoding = self.encodings[action_idx]
-        cost = ConstraintCostEstimator.estimate_cost(feature, selected_encoding)
-        log_prob = m.log_prob(torch.tensor(action_idx))
-        
-        return selected_encoding, cost, log_prob
+            if deterministic:
+                action = torch.argmax(probs, dim=-1).item()
+            else:
+                action = dist.sample().item()
+                
+            log_prob = dist.log_prob(torch.tensor(action))
+            
+        strategy = EncodingType.SINGLE_FIELD if action == 0 else EncodingType.LIMB_DECOMPOSITION
+        cost = ConstraintCostEstimator.estimate_cost(feature, strategy)
+        return strategy, cost, log_prob
 
-    def train_agent(self, features: List[ContractFeature], epochs: int = 100) -> None:
-        """
-        Executes the REINFORCE training loop and tracks metrics via MLflow.
-        """
+    def train_agent(self, features: list[ContractFeature], epochs: int = 50):
         mlflow.set_experiment("Neural_Encoding_Optimization")
         
         with mlflow.start_run():
-            mlflow.log_param("learning_rate", self.optimizer.param_groups[0]['lr'])
-            mlflow.log_param("epochs", epochs)
-            mlflow.log_param("num_features", len(features))
-            
-            logger.info(f"Starting training loop for {epochs} epochs.")
-            
+            mlflow.log_params({
+                "algorithm": "PPO_SingleStep",
+                "learning_rate": 1e-3,
+                "clip_eps": self.clip_eps,
+                "entropy_coef": self.c_entropy
+            })
+
             for epoch in range(epochs):
-                log_probs = []
-                rewards = []
-                epoch_constraints = 0
-                baseline_constraints = 0
+                total_loss = 0.0
                 
-                for feature in features:
-                    # Baseline: Static compiler typically chooses Limb Decomposition for everything
-                    baseline_cost = ConstraintCostEstimator.estimate_cost(feature, EncodingType.LIMB_DECOMPOSITION)
-                    baseline_constraints += baseline_cost
-                    
-                    encoding, cost, log_prob = self.optimize_encoding(feature, deterministic=False)
-                    epoch_constraints += cost
-                    
-                    # Reward is the reduction in constraints (positive is good)
-                    reward = baseline_cost - cost
-                    
-                    log_probs.append(log_prob)
-                    rewards.append(reward)
+                try:
+                    for feature in features:
+                        state = self._feature_to_tensor(feature).unsqueeze(0)
+                        
+                        # Rollout
+                        with torch.no_grad():
+                            logits, old_value = self.model(state)
+                            dist = Categorical(logits=logits)
+                            action = dist.sample()
+                            old_log_prob = dist.log_prob(action)
+                        
+                        strategy = EncodingType.SINGLE_FIELD if action.item() == 0 else EncodingType.LIMB_DECOMPOSITION
+                        cost = ConstraintCostEstimator.estimate_cost(feature, strategy)
+                        reward = torch.tensor([-float(cost)])
+                        advantage = reward - old_value.detach()
 
-                # Calculate constraint reduction percentage
-                reduction_pct = 0.0
-                if baseline_constraints > 0:
-                    reduction_pct = ((baseline_constraints - epoch_constraints) / baseline_constraints) * 100.0
+                        # PPO Update
+                        for _ in range(self.ppo_epochs):
+                            logits, value = self.model(state)
+                            dist = Categorical(logits=logits)
+                            log_prob = dist.log_prob(action)
+                            entropy = dist.entropy()
 
-                # REINFORCE update step
-                policy_loss = []
-                for log_prob, reward in zip(log_probs, rewards):
-                    policy_loss.append(-log_prob * reward)
-                
-                self.optimizer.zero_grad()
-                loss = torch.stack(policy_loss).sum()
-                loss.backward()
-                self.optimizer.step()
-                
-                # Logging metrics to MLflow
-                mlflow.log_metric("loss", loss.item(), step=epoch)
-                mlflow.log_metric("total_constraints", epoch_constraints, step=epoch)
-                mlflow.log_metric("constraint_reduction_pct", reduction_pct, step=epoch)
-                
-                if (epoch + 1) % 10 == 0:
-                    logger.info(f"Epoch {epoch + 1}/{epochs} | Loss: {loss.item():.4f} | Reduction: {reduction_pct:.2f}%")
-            
-            # Практичный обход сломанного PT2-экспортера в MLflow
+                            ratio = torch.exp(log_prob - old_log_prob)
+                            surr1 = ratio * advantage
+                            surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantage
+                            
+                            actor_loss = -torch.min(surr1, surr2).mean()
+                            critic_loss = nn.functional.mse_loss(value, reward.unsqueeze(0))
+                            
+                            loss = actor_loss + self.c_value * critic_loss - self.c_entropy * entropy.mean()
+
+                            self.optimizer.zero_grad()
+                            loss.backward()
+                            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                            self.optimizer.step()
+                            
+                            total_loss += loss.item()
+
+                    mlflow.log_metric("loss", total_loss / len(features), step=epoch)
+                    
+                    if (epoch + 1) % 10 == 0:
+                        logger.info(f"Epoch {epoch + 1}/{epochs} | Total Loss: {total_loss:.4f}")
+
+                except Exception as e:
+                    logger.error(f"Training failed during epoch {epoch}: {e}", exc_info=True)
+                    raise
+
             try:
-                import os
                 model_path = "policy_network.pth"
-                torch.save(self.policy.state_dict(), model_path)
+                torch.save(self.model.state_dict(), model_path)
                 mlflow.log_artifact(model_path, artifact_path="model_weights")
-                os.remove(model_path) # Очищаем локальный мусор
+                if os.path.exists(model_path):
+                    os.remove(model_path)
                 logger.info("Training complete. Model weights logged to MLflow as artifact.")
             except Exception as e:
                 logger.error(f"Model logging to MLflow failed: {e}", exc_info=True)
