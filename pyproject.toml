@@ -16,6 +16,7 @@ dev = [
     "pytest>=8.0.0",
     "black>=24.0.0",
     "ruff>=0.3.0",
+    "dvc>=3.67.1",
 ]
 
 [build-system]
