@@ -1,0 +1,25 @@
+{
+    "version": "1.0",
+    "generator": "Neural-Guided-AOT",
+    "layouts": {
+        "totalSupply": {
+            "type": "uint256",
+            "encoding_strategy": "SINGLE_FIELD",
+            "estimated_constraints": 2
+        },
+        "balances": {
+            "type": "uint256",
+            "encoding_strategy": "SINGLE_FIELD",
+            "estimated_constraints": 15
+        },
+        "owner": {
+            "type": "address",
+            "encoding_strategy": "SINGLE_FIELD",
+            "estimated_constraints": 2
+        }
+    },
+    "summary": {
+        "total_estimated_constraints": 19,
+        "variable_count": 3
+    }
+}

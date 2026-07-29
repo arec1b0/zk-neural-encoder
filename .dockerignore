@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+mlruns/
+mlflow.db
+encoding_manifest.json
+.git/

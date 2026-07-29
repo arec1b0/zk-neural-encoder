@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from typing import List, Dict, Any
 from zk_neural_encoder.analyzer.static_analyzer import StaticAnalyzer, ContractFeature
 from zk_neural_encoder.optimizer.reinforcement_agent import ReinforcementOptimizer
@@ -12,40 +14,55 @@ class AOTOrchestrator:
         self.optimizer = ReinforcementOptimizer()
         logger.info("AOT Pipeline Orchestrator initialized.")
 
-    def run_pipeline(self, abi_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def run_training_pipeline(self, abi_payload: List[Dict[str, Any]], epochs: int = 100) -> None:
         """
-        Executes the full Ahead-Of-Time encoding optimization pipeline.
+        Parses the ABI and executes the RL training loop.
         """
-        logger.info("Starting Neural-Guided Encoding optimization pass.")
+        logger.info("Starting AOT Training Phase.")
+        features: List[ContractFeature] = self.analyzer.parse_abi(abi_payload)
         
-        try:
-            features: List[ContractFeature] = self.analyzer.parse_abi(abi_payload)
-            if not features:
-                logger.warning("No mutable state variables found in the ABI payload.")
-                return {"status": "success", "results": []}
-
-            results = []
-            total_constraints = 0
-
-            for feature in features:
-                encoding, cost = self.optimizer.optimize_encoding(feature)
-                total_constraints += cost
-                
-                results.append({
-                    "feature_name": feature.name,
-                    "data_type": feature.data_type,
-                    "selected_encoding": encoding.value,
-                    "constraint_cost": cost
-                })
-
-            logger.info(f"Pipeline completed. Total estimated constraints: {total_constraints}")
+        if not features:
+            logger.warning("No mutable state variables found. Skipping training.")
+            return
             
-            return {
-                "status": "success",
-                "total_constraints": total_constraints,
-                "results": results
+        self.optimizer.train_agent(features, epochs=epochs)
+
+    def generate_manifest(self, abi_payload: List[Dict[str, Any]], output_path: str = "encoding_manifest.json") -> Dict[str, Any]:
+        """
+        Runs the trained agent deterministically and exports a JSON manifest for ZK compilers.
+        """
+        logger.info("Generating Encoding Manifest.")
+        features: List[ContractFeature] = self.analyzer.parse_abi(abi_payload)
+        
+        manifest = {
+            "version": "1.0",
+            "generator": "Neural-Guided-AOT",
+            "layouts": {}
+        }
+        
+        total_constraints = 0
+        
+        for feature in features:
+            # Deterministic inference for manifest generation
+            encoding, cost, _ = self.optimizer.optimize_encoding(feature, deterministic=True)
+            total_constraints += cost
+            
+            manifest["layouts"][feature.name] = {
+                "type": feature.data_type,
+                "encoding_strategy": encoding.value,
+                "estimated_constraints": cost
             }
             
-        except Exception as e:
-            logger.error(f"Pipeline execution failed: {str(e)}", exc_info=True)
-            return {"status": "error", "message": str(e)}
+        manifest["summary"] = {
+            "total_estimated_constraints": total_constraints,
+            "variable_count": len(features)
+        }
+        
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(manifest, f, indent=4)
+            logger.info(f"Manifest successfully exported to {output_path}")
+        except IOError as e:
+            logger.error(f"Failed to write manifest: {e}")
+            
+        return manifest
