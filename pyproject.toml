@@ -1,0 +1,22 @@
+[project]
+name = "zk-neural-encoder"
+version = "0.1.0"
+description = "Neural-Guided Encoding Optimization for Zero-Knowledge State Transitions"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26.0",
+    "torch>=2.2.0",
+    "pydantic>=2.6.0"
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

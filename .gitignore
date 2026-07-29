@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Data
+data/raw/*
+!data/raw/.gitkeep
+
+# Notebooks
+.ipynb_checkpoints/
